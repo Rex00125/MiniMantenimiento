@@ -1003,7 +1003,124 @@ namespace MiniMantenimiento
                 btnDism.Enabled = true;
             }
         }
-        private void btnWinUpdateFix_Click(object sender, EventArgs e) => Log("Reparar Windows Update: (pendiente de implementar)");
+        // Form1.cs (btnWinUpdateFix_Click actualizado)
+        // Requiere: using System; using System.Threading; using System.Threading.Tasks; using System.Windows.Forms;
+
+        private async void btnWinUpdateFix_Click(object sender, EventArgs e)
+        {
+            // === UI: deshabilita botones y pon barra indeterminada ===
+            btnWinUpdateFix.Enabled = false;
+
+            // opcional: deshabilita también los “pesados” para evitar que corran en paralelo
+            btnSfc.Enabled = false;
+            btnDism.Enabled = false;
+            btnDriversRescan.Enabled = false;
+
+            var oldStyle = pb.Style;
+            pb.Style = ProgressBarStyle.Marquee;
+            pb.MarqueeAnimationSpeed = 25;
+
+            // Cancel por si después quieres cablearlo (por ahora none)
+            var cts = new CancellationTokenSource();
+
+            // Heartbeat: “sigo trabajando…”
+            var heartbeat = new System.Windows.Forms.Timer();
+            heartbeat.Interval = 20000; // 20s
+            heartbeat.Tick += (s, ev) =>
+            {
+                Log("WinUpdate: sigo trabajando... (esto es normal)");
+            };
+            heartbeat.Start();
+
+            var start = DateTime.Now;
+
+            try
+            {
+                Log("WinUpdate: iniciando...");
+
+                bool isAdmin = IsRunningAsAdmin(); // ya la tienes en tu Form1
+                if (!isAdmin)
+                {
+                    Log("WinUpdate: sin permisos de Administrador. No se puede ejecutar.");
+                    MessageBox.Show(
+                        this,
+                        "Este módulo requiere permisos de Administrador.\n\n" +
+                        "Cierra y abre la app como Administrador.",
+                        "WinUpdate",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning
+                    );
+                    return;
+                }
+
+                // === Modo profundo (seguro) ===
+                // Si luego quieres un checkbox, aquí lo cambias:
+                bool deepMode = true;
+
+                var result = await MiniMantenimiento.Tasks.WinUpdateTask.RunAsync(
+                    isAdmin: true,
+                    log: Log,
+                    ct: cts.Token,
+                    deepMode: deepMode
+                );
+
+                // === Mensaje final humano ===
+                var icon = MessageBoxIcon.Information;
+                if (result.Outcome != MiniMantenimiento.Tasks.WinUpdateTask.WinUpdateOutcome.Ok)
+                    icon = MessageBoxIcon.Warning;
+
+                MessageBox.Show(
+                    this,
+                    "WinUpdate finalizó.\n\n" +
+                    (result.HumanSummary ?? "Revisa el log para el detalle.") +
+                    "\n\nDuración: " + result.Duration.ToString(),
+                    "WinUpdate",
+                    MessageBoxButtons.OK,
+                    icon
+                );
+            }
+            catch (OperationCanceledException)
+            {
+                Log("WinUpdate: operación cancelada.");
+                MessageBox.Show(
+                    this,
+                    "WinUpdate fue cancelado.\nRevisa el log para el detalle.",
+                    "WinUpdate",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning
+                );
+            }
+            catch (Exception ex)
+            {
+                Log("WinUpdate: ERROR -> " + ex.Message);
+                MessageBox.Show(
+                    this,
+                    "Ocurrió un error al ejecutar WinUpdate.\n\n" + ex.Message,
+                    "WinUpdate",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
+            }
+            finally
+            {
+                // === Apaga heartbeat SIEMPRE ===
+                try { heartbeat.Stop(); } catch { }
+                try { heartbeat.Dispose(); } catch { }
+
+                // === UI: restaura ===
+                pb.Style = oldStyle;
+                pb.MarqueeAnimationSpeed = 0;
+
+                btnWinUpdateFix.Enabled = true;
+                btnSfc.Enabled = IsRunningAsAdmin();
+                btnDism.Enabled = IsRunningAsAdmin();
+                btnDriversRescan.Enabled = IsRunningAsAdmin();
+
+                Log("WinUpdate: listo.");
+            }
+        }
+
+
         private async void btnDriversRescan_Click(object sender, EventArgs e)
         {
             btnDriversRescan.Enabled = false;
