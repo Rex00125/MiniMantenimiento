@@ -39,10 +39,11 @@ namespace MiniMantenimiento.Reports
             public int? EventId;
             public string Provider;
             public string MachineName;
-            public string User;
+            public string User;            // DOMAIN\User o SID (fallback)
             public string TaskCategory;
-            public string Message; // puede ser null si no se pudo formatear
+            public string Message;         // puede ser null si no se pudo formatear
         }
+
         public class Summary
         {
             public int Critical;
@@ -77,14 +78,15 @@ namespace MiniMantenimiento.Reports
             public string Detail;
         }
 
-
         public class Result
         {
             public List<Entry> Entries = new List<Entry>();
             public List<string> Warnings = new List<string>(); // warnings no críticos (ej. permisos)
         }
-        //*HELPERS*//
 
+        // ==========================
+        // HELPERS
+        // ==========================
         public static Summary BuildSummary(IEnumerable<Entry> entries)
         {
             var s = new Summary();
@@ -107,14 +109,16 @@ namespace MiniMantenimiento.Reports
         {
             if (string.IsNullOrWhiteSpace(msg)) return "";
             msg = msg.Replace("\r\n", " ").Replace("\n", " ").Trim();
-            if (msg.Length > 180) msg = msg.Substring(0, 180);
+
+            // ✅ antes 180, ahora 350 para no perder códigos/errores al final
+            if (msg.Length > 350) msg = msg.Substring(0, 350);
+
             return msg;
         }
 
         public static List<GroupedEntry> GroupDuplicates(IEnumerable<Entry> entries)
         {
             // Agrupa por: Log + Level + Provider + EventId + firma del mensaje
-            // (si el mensaje es null, igual agrupa por lo demás)
             var groups = entries
                 .GroupBy(e => new
                 {
@@ -126,10 +130,16 @@ namespace MiniMantenimiento.Reports
                 })
                 .Select(g =>
                 {
-                    var first = g.Where(x => x.TimeCreatedLocal.HasValue).OrderBy(x => x.TimeCreatedLocal.Value).FirstOrDefault();
-                    var last = g.Where(x => x.TimeCreatedLocal.HasValue).OrderByDescending(x => x.TimeCreatedLocal.Value).FirstOrDefault();
+                    var first = g.Where(x => x.TimeCreatedLocal.HasValue)
+                                 .OrderBy(x => x.TimeCreatedLocal.Value)
+                                 .FirstOrDefault();
 
-                    var sample = g.Select(x => x.Message).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+                    var last = g.Where(x => x.TimeCreatedLocal.HasValue)
+                                .OrderByDescending(x => x.TimeCreatedLocal.Value)
+                                .FirstOrDefault();
+
+                    var sample = g.Select(x => x.Message)
+                                  .FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
                     sample = NormalizeForKey(sample);
 
                     var ge = new GroupedEntry
@@ -158,10 +168,7 @@ namespace MiniMantenimiento.Reports
 
         private static void ApplyActionableHeuristic(GroupedEntry g)
         {
-            // Heurísticas prácticas (no perfectas) para marcar “vale la pena revisar”.
-            // Regla general: hardware/almacenamiento/actualizaciones/servicios críticos => actionable
-            // DCOM 10016 y ruido típico => no actionable (a menos que el usuario decida lo contrario)
-
+            // Heurísticas prácticas para triage (no perfectas)
             string prov = (g.Provider ?? "").ToLowerInvariant();
             int id = g.EventId ?? -1;
 
@@ -242,10 +249,21 @@ namespace MiniMantenimiento.Reports
 
             // 1) Detectar reinicios/apagados cercanos usando IDs típicos
             // 6005 (Event Log started), 6006 (stopped), 6008 (unexpected shutdown), 1074 (planned shutdown), Kernel-Power 41
+            // ✅ FIX: corregida precedencia de &&/||
             var rebootMarkers = entries.Where(e =>
-                (e.Provider ?? "").IndexOf("EventLog", StringComparison.OrdinalIgnoreCase) >= 0 && (e.EventId == 6005 || e.EventId == 6006 || e.EventId == 6008) ||
-                ((e.Provider ?? "").IndexOf("Kernel-Power", StringComparison.OrdinalIgnoreCase) >= 0 && e.EventId == 41) ||
-                (e.EventId == 1074)
+                (
+                    (
+                        (e.Provider ?? "").IndexOf("EventLog", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        (e.EventId == 6005 || e.EventId == 6006 || e.EventId == 6008)
+                    )
+                    ||
+                    (
+                        (e.Provider ?? "").IndexOf("Kernel-Power", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        e.EventId == 41
+                    )
+                    ||
+                    (e.EventId == 1074)
+                )
             )
             .Where(e => e.TimeCreatedLocal.HasValue)
             .OrderByDescending(e => e.TimeCreatedLocal.Value)
@@ -300,8 +318,10 @@ namespace MiniMantenimiento.Reports
 
             return list;
         }
-//**//
 
+        // ==========================
+        // GENERATE
+        // ==========================
         public static Result Generate(Options opt, CancellationToken ct = default(CancellationToken), Action<int> progress = null)
         {
             if (opt == null) throw new ArgumentNullException(nameof(opt));
@@ -312,11 +332,9 @@ namespace MiniMantenimiento.Reports
             var res = new Result();
 
             // Convertimos FromUtc a string ISO para XPath (UTC)
-            // Eventing query usa SystemTime en UTC
             string fromIsoUtc = opt.FromUtc.ToString("o", CultureInfo.InvariantCulture);
 
             // Filtro: TimeCreated >= from + Level in (...)
-            // Level se filtra como número
             string levelFilter = string.Join(" or ", opt.Levels.Select(l => "Level=" + ((int)l).ToString(CultureInfo.InvariantCulture)));
             string query = "*[System[TimeCreated[@SystemTime>='" + fromIsoUtc + "'] and (" + levelFilter + ")]]";
 
@@ -331,7 +349,6 @@ namespace MiniMantenimiento.Reports
                 {
                     var elq = new EventLogQuery(logName, PathType.LogName, query)
                     {
-                        // Si no hay permisos para Security, etc., esto puede fallar
                         ReverseDirection = true, // más recientes primero
                         TolerateQueryErrors = true
                     };
@@ -358,20 +375,19 @@ namespace MiniMantenimiento.Reports
 
                             using (ev)
                             {
-                                var entry = new Entry();
-                                entry.LogName = logName;
-                                entry.TimeCreatedLocal = ev.TimeCreated.HasValue ? ev.TimeCreated.Value.ToLocalTime() : (DateTime?)null;
-                                entry.EventId = ev.Id;
-                                entry.Provider = ev.ProviderName;
-                                entry.MachineName = ev.MachineName;
-                                entry.TaskCategory = ev.TaskDisplayName;
-                                entry.User = TryGetUser(ev);
-                                entry.Level = MapLevel(ev.Level);
+                                var entry = new Entry
+                                {
+                                    LogName = logName,
+                                    TimeCreatedLocal = ev.TimeCreated.HasValue ? ev.TimeCreated.Value.ToLocalTime() : (DateTime?)null,
+                                    EventId = ev.Id,
+                                    Provider = ev.ProviderName,
+                                    MachineName = ev.MachineName,
+                                    TaskCategory = ev.TaskDisplayName,
+                                    User = TryGetUser(ev),
+                                    Level = MapLevel(ev.Level)
+                                };
 
-                                if (opt.IncludeFullMessage)
-                                    entry.Message = TryFormatMessage(ev);
-                                else
-                                    entry.Message = TryFormatMessageShort(ev);
+                                entry.Message = opt.IncludeFullMessage ? TryFormatMessage(ev) : TryFormatMessageShort(ev);
 
                                 res.Entries.Add(entry);
                                 total++;
@@ -396,12 +412,22 @@ namespace MiniMantenimiento.Reports
             return res;
         }
 
+        // ✅ ahora intenta traducir a DOMAIN\Usuario (fallback a SID)
         private static string TryGetUser(EventRecord ev)
         {
             try
             {
                 if (ev.UserId == null) return null;
-                return ev.UserId.Value;
+
+                try
+                {
+                    var nt = (System.Security.Principal.NTAccount)ev.UserId.Translate(typeof(System.Security.Principal.NTAccount));
+                    return nt.Value;
+                }
+                catch
+                {
+                    return ev.UserId.Value; // SID fallback
+                }
             }
             catch { return null; }
         }
@@ -435,7 +461,6 @@ namespace MiniMantenimiento.Reports
 
         private static string TryFormatMessageShort(EventRecord ev)
         {
-            // Para modo "ligero": tomamos primeras ~200 chars del mensaje si existe
             string full = TryFormatMessage(ev);
             if (string.IsNullOrWhiteSpace(full)) return null;
 
@@ -461,13 +486,11 @@ namespace MiniMantenimiento.Reports
             sb.AppendLine("Generado: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             sb.AppendLine();
 
-            // Resumen por severidad (tu punto #1)
             sb.AppendLine("== Resumen por severidad ==");
             sb.AppendLine($"Errores: {summary.Error} | Críticos: {summary.Critical} | Advertencias: {summary.Warning} | Información: {summary.Information} | Verbose: {summary.Verbose}");
             sb.AppendLine($"Total exportado: {summary.Total}");
             sb.AppendLine();
 
-            // Contexto temporal (tu punto #4)
             if (insights.Count > 0)
             {
                 sb.AppendLine("== Contexto temporal ==");
@@ -479,7 +502,6 @@ namespace MiniMantenimiento.Reports
                 sb.AppendLine();
             }
 
-            // Actionable (tu punto #3)
             sb.AppendLine("== Eventos marcados como [ACTIONABLE] ==");
             if (actionable.Count == 0)
             {
@@ -498,7 +520,6 @@ namespace MiniMantenimiento.Reports
             }
             sb.AppendLine();
 
-            // Agrupados (tu punto #2)
             sb.AppendLine("== Agrupación de eventos repetidos (Top 80 por frecuencia) ==");
             foreach (var g in grouped.Take(80))
             {
@@ -510,7 +531,6 @@ namespace MiniMantenimiento.Reports
             }
             sb.AppendLine();
 
-            // Advertencias del motor
             if (result.Warnings.Count > 0)
             {
                 sb.AppendLine("== Advertencias del generador ==");
@@ -518,14 +538,12 @@ namespace MiniMantenimiento.Reports
                 sb.AppendLine();
             }
 
-            // Conclusión honesta (como pediste)
             sb.AppendLine("== Conclusión honesta ==");
             sb.AppendLine("El reporte agrupa y prioriza, pero usa heurísticas: sirve para triage, no para veredicto absoluto.");
             sb.AppendLine("Si algo se repite mucho, es crítico o está marcado como [ACTIONABLE], vale la pena investigarlo primero.");
 
             File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
         }
-
 
         public static void ExportCsv(Result result, string path)
         {
@@ -552,10 +570,10 @@ namespace MiniMantenimiento.Reports
                 ));
             }
 
+            // BOM para Excel
             var utf8Bom = new UTF8Encoding(true);
             File.WriteAllText(path, sb.ToString(), utf8Bom);
         }
-
 
         private static string Csv(string s)
         {

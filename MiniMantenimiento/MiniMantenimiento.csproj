@@ -59,9 +59,15 @@
     <Compile Include="Form1.Designer.cs">
       <DependentUpon>Form1.cs</DependentUpon>
     </Compile>
+    <Compile Include="Helpers\AdminUtil.cs" />
+    <Compile Include="Helpers\UiLogger.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="Reports\EventLogReport.cs" />
+    <Compile Include="Services\CleanupService.cs" />
+    <Compile Include="Services\CommandRunner.cs" />
+    <Compile Include="Services\HealthCheckService.cs" />
+    <Compile Include="Services\NetworkResetService.cs" />
     <Compile Include="Tasks\CleanupTasks.cs" />
     <Compile Include="Tasks\DismTask.cs" />
     <Compile Include="Tasks\DriversRescanTask.cs" />

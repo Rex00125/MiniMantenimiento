@@ -3,8 +3,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Management;
@@ -13,19 +13,31 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+
 using MiniMantenimiento.Reports;
-using System.Threading;
 using MiniMantenimiento.Tasks;
+using MiniMantenimiento.Helpers;
+using MiniMantenimiento.Services;
+using MiniMantenimiento.Utils;
 
 namespace MiniMantenimiento
 {
     public partial class Form1 : Form
     {
+        // backing log (para exportar)
+        private readonly StringBuilder _log = new StringBuilder();
 
-        private readonly System.Text.StringBuilder _log = new System.Text.StringBuilder();
+        // Logger desacoplado
+        private UiLogger _logger;
 
+        // Servicios extraídos
+        private readonly HealthCheckService _health = new HealthCheckService();
+        private readonly CleanupService _cleanup = new CleanupService();
+        private readonly CommandRunner _runner = new CommandRunner();
+        private NetworkResetService _netReset;
 
         public Form1()
         {
@@ -34,6 +46,13 @@ namespace MiniMantenimiento
 
         private void Form1_Load(object sender, EventArgs e)
         {
+            // Logger (ya con UI lista)
+            _logger = new UiLogger(this, txtLog, _log);
+            _netReset = new NetworkResetService(_runner);
+
+            // Status inicial
+            SetStatus("Listo.");
+
             // Cargar defaults del visor
             clbLogs.Items.Clear();
             clbLogs.Items.Add("System", true);
@@ -55,340 +74,106 @@ namespace MiniMantenimiento
             cmbRange.SelectedIndex = 1;
 
             // Estado admin
-            bool isAdmin = IsRunningAsAdmin();
+            RefreshAdminUi();
+
+            _logger.Log("App iniciada.");
+        }
+
+        // =========================
+        // Helpers UI
+        // =========================
+
+        private void SetStatus(string text)
+        {
+            if (lblStatus == null) return;
+
+            try
+            {
+                if (InvokeRequired)
+                {
+                    BeginInvoke((Action)(() => { lblStatus.Text = text ?? ""; }));
+                    return;
+                }
+                lblStatus.Text = text ?? "";
+            }
+            catch { }
+        }
+
+        private void RefreshAdminUi()
+        {
+            bool isAdmin = AdminHelper.IsRunningAsAdmin();
+
             lblAdminStatus.Text = isAdmin
                 ? "Estado: Ejecutando como Administrador ✅ (reparaciones avanzadas habilitadas)"
                 : "Estado: Sin permisos de Administrador ⚠️ (algunas reparaciones se deshabilitarán)";
 
+            // Botones que sí requieren admin
             btnSfc.Enabled = isAdmin;
             btnDism.Enabled = isAdmin;
             btnWinUpdateFix.Enabled = isAdmin;
             btnDriversRescan.Enabled = isAdmin;
-            btnNetReset.Enabled = isAdmin; // safe por ahora (lo puedes cambiar luego)
 
-            Log("App iniciada.");
+            // NetReset: tú decidías. Lo dejo como admin porque tu flujo lo trae así.
+            btnNetReset.Enabled = isAdmin;
+        }
+
+        private void SetBusy(bool busy, string statusText)
+        {
+            SetStatus(statusText);
+
+            pb.Style = busy ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
+            pb.MarqueeAnimationSpeed = busy ? 25 : 0;
+
+            // Evita ejecutar tareas en paralelo (se pisan logs / servicios)
+            gbAcciones.Enabled = !busy;
+            gbEventReport.Enabled = !busy;
         }
 
         // =========================
-        // Logger
-        // =========================
-        private void Log(string message)
-        {
-            if (string.IsNullOrWhiteSpace(message)) return;
-
-            if (this.InvokeRequired)
-            {
-                try { this.BeginInvoke((Action)(() => Log(message))); }
-                catch { }
-                return;
-            }
-
-            string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
-            _log.AppendLine(line);
-            txtLog.AppendText(line + Environment.NewLine);
-        }
-
-
-        private static bool IsRunningAsAdmin()
-        {
-            try
-            {
-                using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
-                {
-                    WindowsPrincipal principal = new WindowsPrincipal(identity);
-                    return principal.IsInRole(WindowsBuiltInRole.Administrator);
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private string FormatBytes(ulong bytes)
-        {
-            double b = bytes;
-            string[] units = { "B", "KB", "MB", "GB", "TB" };
-            int u = 0;
-
-            while (b >= 1024 && u < units.Length - 1)
-            {
-                b /= 1024;
-                u++;
-            }
-
-            return string.Format("{0:0.##} {1}", b, units[u]);
-        }
-
-        private string FormatUptime()
-        {
-            try
-            {
-                long ms = (long)(uint)Environment.TickCount;
-                var ts = TimeSpan.FromMilliseconds(ms);
-
-                if (ts.TotalDays >= 1)
-                    return string.Format("{0}d {1}h {2}m", ts.Days, ts.Hours, ts.Minutes);
-                if (ts.TotalHours >= 1)
-                    return string.Format("{0}h {1}m", (int)ts.TotalHours, ts.Minutes);
-                return string.Format("{0}m {1}s", ts.Minutes, ts.Seconds);
-            }
-            catch
-            {
-                return "(no disponible)";
-            }
-        }
-
-        // =========================
-        // Chequeo rápido
+        // Chequeo rápido (servicio)
         // =========================
         private void btnHealthCheck_Click(object sender, EventArgs e)
         {
             btnHealthCheck.Enabled = false;
             pb.Style = ProgressBarStyle.Marquee;
+            SetStatus("Chequeo rápido en progreso...");
 
-            Log("Chequeo rápido: iniciando...");
+            _logger.Log("Chequeo rápido: iniciando...");
 
             Task.Run(() =>
             {
                 try
                 {
-                    var lines = BuildHealthCheckLines();
+                    var lines = _health.BuildHealthCheckLines();
 
-                    this.BeginInvoke((Action)(() =>
+                    BeginInvoke((Action)(() =>
                     {
                         foreach (var line in lines)
-                            Log(line);
+                            _logger.Log(line);
 
-                        Log("Chequeo rápido: listo ✅");
+                        _logger.Log("Chequeo rápido: listo ✅");
+                        SetStatus("Listo.");
                     }));
                 }
                 catch (Exception ex)
                 {
-                    this.BeginInvoke((Action)(() =>
+                    BeginInvoke((Action)(() =>
                     {
-                        Log("Chequeo rápido: error ❌ " + ex.Message);
+                        _logger.Log("Chequeo rápido: error ❌ " + ex.Message);
+                        SetStatus("Error en Chequeo rápido.");
                         MessageBox.Show(this, "Error en Chequeo rápido:\n\n" + ex, "Error",
                             MessageBoxButtons.OK, MessageBoxIcon.Error);
                     }));
                 }
                 finally
                 {
-                    this.BeginInvoke((Action)(() =>
+                    BeginInvoke((Action)(() =>
                     {
                         pb.Style = ProgressBarStyle.Blocks;
                         btnHealthCheck.Enabled = true;
                     }));
                 }
             });
-        }
-
-        private List<string> BuildHealthCheckLines()
-        {
-            var lines = new List<string>();
-
-            lines.Add("===== CHEQUEO RÁPIDO =====");
-            lines.Add("Equipo: " + Environment.MachineName);
-            lines.Add("Usuario: " + Environment.UserName);
-            lines.Add("Número de serie: " + GetSerialNumber());
-            lines.Add("Windows: " + GetWindowsFriendlyName());
-            lines.Add("Arquitectura: " + (Environment.Is64BitOperatingSystem ? "64-bit" : "32-bit"));
-            lines.Add("Uptime: " + FormatUptime());
-
-            string cpu = GetCpuName();
-            if (!string.IsNullOrWhiteSpace(cpu))
-                lines.Add("CPU: " + cpu);
-
-            var ram = GetRamInfo();
-            if (ram.TotalBytes > 0)
-            {
-                lines.Add(string.Format("RAM: Total {0} | Disponible {1}",
-                    FormatBytes(ram.TotalBytes),
-                    FormatBytes(ram.AvailableBytes)));
-            }
-
-            lines.Add("Discos:");
-            foreach (var d in GetDiskInfo())
-                lines.Add("  - " + d);
-
-            lines.Add("Red:");
-            foreach (var n in GetNetworkInfo())
-                lines.Add("  - " + n);
-
-            lines.Add("==========================");
-
-            return lines;
-        }
-
-        private string GetWindowsFriendlyName()
-        {
-            try
-            {
-                using (var searcher = new ManagementObjectSearcher("SELECT Caption, Version FROM Win32_OperatingSystem"))
-                {
-                    foreach (ManagementObject os in searcher.Get())
-                    {
-                        string caption = (os["Caption"] != null) ? os["Caption"].ToString().Trim() : "";
-                        string version = (os["Version"] != null) ? os["Version"].ToString().Trim() : "";
-                        if (!string.IsNullOrWhiteSpace(caption))
-                            return caption + (string.IsNullOrWhiteSpace(version) ? "" : " (v" + version + ")");
-                    }
-                }
-            }
-            catch { }
-
-            return Environment.OSVersion.VersionString;
-        }
-
-        private string GetSerialNumber()
-        {
-            try
-            {
-                using (var searcher = new ManagementObjectSearcher("SELECT SerialNumber FROM Win32_BIOS"))
-                {
-                    foreach (ManagementObject bios in searcher.Get())
-                    {
-                        string serial = bios["SerialNumber"] as string;
-                        if (!string.IsNullOrWhiteSpace(serial))
-                        {
-                            serial = serial.Trim();
-                            if (serial.Equals("Default string", StringComparison.OrdinalIgnoreCase) ||
-                                serial.IndexOf("O.E.M", StringComparison.OrdinalIgnoreCase) >= 0)
-                                return "(no definido por el fabricante)";
-                            return serial;
-                        }
-                    }
-                }
-            }
-            catch { }
-
-            return "(no disponible)";
-        }
-
-        private string GetCpuName()
-        {
-            try
-            {
-                using (var searcher = new ManagementObjectSearcher("SELECT Name FROM Win32_Processor"))
-                {
-                    foreach (ManagementObject cpu in searcher.Get())
-                    {
-                        var name = cpu["Name"] as string;
-                        if (!string.IsNullOrWhiteSpace(name))
-                            return name.Trim();
-                    }
-                }
-            }
-            catch { }
-            return "";
-        }
-
-        private (ulong TotalBytes, ulong AvailableBytes) GetRamInfo()
-        {
-            try
-            {
-                using (var searcher = new ManagementObjectSearcher("SELECT TotalVisibleMemorySize, FreePhysicalMemory FROM Win32_OperatingSystem"))
-                {
-                    foreach (ManagementObject os in searcher.Get())
-                    {
-                        ulong totalKb = 0;
-                        ulong freeKb = 0;
-
-                        if (os["TotalVisibleMemorySize"] != null)
-                            totalKb = Convert.ToUInt64(os["TotalVisibleMemorySize"]);
-
-                        if (os["FreePhysicalMemory"] != null)
-                            freeKb = Convert.ToUInt64(os["FreePhysicalMemory"]);
-
-                        return (totalKb * 1024UL, freeKb * 1024UL);
-                    }
-                }
-            }
-            catch { }
-
-            return (0, 0);
-        }
-
-        private IEnumerable<string> GetDiskInfo()
-        {
-            var list = new List<string>();
-            try
-            {
-                foreach (DriveInfo drive in DriveInfo.GetDrives())
-                {
-                    if (!drive.IsReady) continue;
-
-                    long total = drive.TotalSize;
-                    long free = drive.AvailableFreeSpace;
-                    double pctFree = total > 0 ? (free * 100.0 / total) : 0;
-
-                    list.Add(string.Format("{0} ({1}) - Libre: {2} / {3} ({4:0.0}% libre)",
-                        drive.Name,
-                        drive.DriveType,
-                        FormatBytes((ulong)free),
-                        FormatBytes((ulong)total),
-                        pctFree));
-                }
-            }
-            catch (Exception ex)
-            {
-                list.Add("Discos: error al leer (" + ex.Message + ")");
-            }
-
-            if (list.Count == 0)
-                list.Add("No se pudieron enumerar discos.");
-
-            return list;
-        }
-
-        private IEnumerable<string> GetNetworkInfo()
-        {
-            var list = new List<string>();
-
-            try
-            {
-                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
-
-                    var ipProps = ni.GetIPProperties();
-
-                    var ipv4s = ipProps.UnicastAddresses
-                        .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork)
-                        .Select(a => a.Address.ToString())
-                        .ToList();
-
-                    if (ipv4s.Count == 0) continue;
-
-                    var gw = ipProps.GatewayAddresses
-                        .Select(g => g.Address)
-                        .Where(a => a != null && a.AddressFamily == AddressFamily.InterNetwork)
-                        .Select(a => a.ToString())
-                        .FirstOrDefault();
-
-                    var dns = ipProps.DnsAddresses
-                        .Where(a => a.AddressFamily == AddressFamily.InterNetwork)
-                        .Select(a => a.ToString())
-                        .Take(3)
-                        .ToList();
-
-                    string line = ni.Name + " | IP: " + string.Join(", ", ipv4s);
-                    if (!string.IsNullOrWhiteSpace(gw)) line += " | GW: " + gw;
-                    if (dns.Count > 0) line += " | DNS: " + string.Join(", ", dns);
-
-                    list.Add(line);
-                }
-            }
-            catch (Exception ex)
-            {
-                list.Add("Red: error al leer (" + ex.Message + ")");
-            }
-
-            if (list.Count == 0)
-                list.Add("No se detectó interfaz activa con IPv4.");
-
-            return list;
         }
 
         // =========================
@@ -398,271 +183,70 @@ namespace MiniMantenimiento
         {
             btnCleanup.Enabled = false;
             pb.Style = ProgressBarStyle.Marquee;
+            SetStatus("Limpieza en progreso...");
 
             bool emptyBin = (chkEmptyRecycleBin != null && chkEmptyRecycleBin.Checked);
 
-            Log("Limpieza: iniciando...");
-            if (emptyBin) Log("Limpieza: Papelera marcada para vaciar.");
+            _logger.Log("Limpieza: iniciando...");
+            if (emptyBin) _logger.Log("Limpieza: Papelera marcada para vaciar.");
 
             Task.Run(() =>
             {
-                CleanupResult result = null;
+                CleanupService.CleanupResult result = null;
                 Exception caught = null;
 
                 try
                 {
-                    // 1) Temporales en background
-                    result = RunCleanup(false); // <-- OJO: aquí NO vaciamos papelera
+                    result = _cleanup.RunCleanup();
                 }
                 catch (Exception ex)
                 {
                     caught = ex;
                 }
 
-                this.BeginInvoke((Action)(() =>
+                BeginInvoke((Action)(() =>
                 {
                     try
                     {
                         if (caught != null)
                         {
-                            Log("Limpieza: error ❌ " + caught.Message);
+                            _logger.Log("Limpieza: error ❌ " + caught.Message);
+                            SetStatus("Error en Limpieza.");
                             MessageBox.Show(this, "Error al limpiar temporales:\n\n" + caught, "Error",
                                 MessageBoxButtons.OK, MessageBoxIcon.Error);
                             return;
                         }
 
-                        // Log de temporales
                         foreach (var line in result.LogLines)
-                            Log(line);
+                            _logger.Log(line);
 
-                        // 2) Papelera en UI thread
                         if (emptyBin)
                         {
-                            Log("Vaciando Papelera...");
+                            _logger.Log("Vaciando Papelera...");
                             string msg;
                             int hr;
-                            bool ok = TryEmptyRecycleBin(out msg, out hr);
-                            Log(ok ? "  -> Papelera vaciada ✅" : ("  -> Papelera: " + (msg ?? "falló") + " (hr=0x" + hr.ToString("X8") + ")"));
+                            bool ok = _cleanup.TryEmptyRecycleBin(out msg, out hr);
+
+                            _logger.Log(ok
+                                ? "  -> Papelera vaciada ✅"
+                                : ("  -> Papelera: " + (msg ?? "falló") + " (hr=0x" + hr.ToString("X8") + ")"));
                         }
 
-                        Log(string.Format("Limpieza: liberado aprox. {0} ✅", FormatBytes((ulong)result.FreedBytes)));
+                        _logger.Log($"Limpieza: liberado aprox. {result.FreedBytes} bytes ✅");
+                        SetStatus("Limpieza completada.");
                     }
                     finally
                     {
                         pb.Style = ProgressBarStyle.Blocks;
                         btnCleanup.Enabled = true;
+                        SetStatus("Listo.");
                     }
                 }));
             });
         }
 
-
-
-        private class CleanupResult
-        {
-            public long FreedBytes;
-            public List<string> LogLines = new List<string>();
-        }
-
-        private CleanupResult RunCleanup(bool _)
-        {
-            var res = new CleanupResult();
-
-            string userTemp = Path.GetTempPath();
-            string windowsTemp = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp");
-
-            var targets = new List<string> { userTemp, windowsTemp };
-
-            res.LogLines.Add("===== LIMPIEZA =====");
-            res.LogLines.Add("Objetivos:");
-            foreach (var t in targets) res.LogLines.Add("  - " + t);
-
-            long totalEstimatedFreed = 0;
-
-            foreach (string path in targets)
-            {
-                long beforeBytes = TryGetDirectorySize(path, out string sizeNote);
-                res.LogLines.Add(string.Format("Analizando: {0} | Tamaño aprox: {1}{2}",
-                    path,
-                    FormatBytes((ulong)beforeBytes),
-                    string.IsNullOrWhiteSpace(sizeNote) ? "" : " (" + sizeNote + ")"));
-
-                long deletedBytes = SafeDeleteDirectoryContents(path, res.LogLines);
-                totalEstimatedFreed += deletedBytes;
-
-                res.LogLines.Add(string.Format("  -> Borrado aprox en {0}: {1}", path, FormatBytes((ulong)deletedBytes)));
-            }
-
-
-
-            res.FreedBytes = totalEstimatedFreed;
-            res.LogLines.Add("====================");
-
-            return res;
-        }
-
-        private long SafeDeleteDirectoryContents(string path, List<string> logLines)
-        {
-            long deletedBytes = 0;
-
-            try
-            {
-                if (!Directory.Exists(path))
-                {
-                    logLines.Add("  [WARN] No existe: " + path);
-                    return 0;
-                }
-
-                string[] files = null;
-                try { files = Directory.GetFiles(path); }
-                catch (Exception ex) { logLines.Add("  [WARN] No se pudieron listar archivos: " + ex.Message); }
-
-                if (files != null)
-                {
-                    foreach (var file in files)
-                    {
-                        try
-                        {
-                            var fi = new FileInfo(file);
-                            long len = fi.Exists ? fi.Length : 0;
-
-                            try { File.SetAttributes(file, FileAttributes.Normal); } catch { }
-                            File.Delete(file);
-
-                            deletedBytes += len;
-                        }
-                        catch (Exception ex)
-                        {
-                            logLines.Add("  [WARN] No se pudo borrar archivo: " + file + " | " + ex.Message);
-                        }
-                    }
-                }
-
-                string[] dirs = null;
-                try { dirs = Directory.GetDirectories(path); }
-                catch (Exception ex) { logLines.Add("  [WARN] No se pudieron listar carpetas: " + ex.Message); }
-
-                if (dirs != null)
-                {
-                    foreach (var dir in dirs)
-                        deletedBytes += SafeDeleteDirectoryTree(dir, logLines);
-                }
-            }
-            catch (Exception ex)
-            {
-                logLines.Add("  [WARN] Error general en " + path + ": " + ex.Message);
-            }
-
-            return deletedBytes;
-        }
-
-        private long SafeDeleteDirectoryTree(string dir, List<string> logLines)
-        {
-            long bytesDeleted = 0;
-
-            try
-            {
-                long approxSize = TryGetDirectorySize(dir, out _);
-
-                try
-                {
-                    foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
-                    {
-                        try { File.SetAttributes(f, FileAttributes.Normal); } catch { }
-                    }
-                }
-                catch { }
-
-                Directory.Delete(dir, true);
-                bytesDeleted += approxSize;
-            }
-            catch (Exception ex)
-            {
-                logLines.Add("  [WARN] No se pudo borrar carpeta: " + dir + " | " + ex.Message);
-
-                bytesDeleted += SafeDeleteDirectoryContents(dir, logLines);
-
-                try { Directory.Delete(dir, false); } catch { }
-            }
-
-            return bytesDeleted;
-        }
-
-        private long TryGetDirectorySize(string path, out string note)
-        {
-            note = null;
-
-            try
-            {
-                if (!Directory.Exists(path))
-                {
-                    note = "no existe";
-                    return 0;
-                }
-
-                long size = 0;
-
-                foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
-                {
-                    try
-                    {
-                        var fi = new FileInfo(file);
-                        if (fi.Exists) size += fi.Length;
-                    }
-                    catch { }
-                }
-
-                return size;
-            }
-            catch (Exception ex)
-            {
-                note = "no se pudo calcular: " + ex.Message;
-                return 0;
-            }
-        }
-
-        // Papelera (WinAPI)
-        [Flags]
-        private enum RecycleFlags : uint
-        {
-            SHERB_NOCONFIRMATION = 0x00000001,
-            SHERB_NOPROGRESSUI = 0x00000002,
-            SHERB_NOSOUND = 0x00000004
-        }
-
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-        private static extern int SHEmptyRecycleBin(IntPtr hwnd, string pszRootPath, RecycleFlags dwFlags);
-
-        private bool TryEmptyRecycleBin(out string message, out int hresult)
-        {
-            message = null;
-            hresult = 0;
-
-            try
-            {
-                int hr = SHEmptyRecycleBin(
-                    IntPtr.Zero,   // <-- NO uses this.Handle desde background
-                    null,
-                    RecycleFlags.SHERB_NOCONFIRMATION | RecycleFlags.SHERB_NOPROGRESSUI | RecycleFlags.SHERB_NOSOUND);
-
-                hresult = hr;
-
-                if (hr == 0) return true;
-
-                message = "No se pudo vaciar (HRESULT: 0x" + hr.ToString("X8") + ")";
-                return false;
-            }
-            catch (Exception ex)
-            {
-                message = ex.Message;
-                return false;
-            }
-        }
-
-
-
         // =========================
-        // Placeholders (siguiente)
+        // Reset de red (servicio)
         // =========================
         private void btnNetReset_Click(object sender, EventArgs e)
         {
@@ -679,64 +263,32 @@ namespace MiniMantenimiento
 
             btnNetReset.Enabled = false;
             pb.Style = ProgressBarStyle.Marquee;
+            SetStatus("Reset de red en progreso...");
 
-            Log("Reset de red: iniciando...");
+            _logger.Log("Reset de red: iniciando...");
 
             Task.Run(() =>
             {
+                NetworkResetService.NetworkResetResult result = null;
                 Exception caught = null;
-                var steps = new List<Tuple<string, CmdResult>>();
-
-                // OEM codepage del sistema (MX/ES normalmente 850)
-                int oemCp = System.Globalization.CultureInfo.CurrentCulture.TextInfo.OEMCodePage;
-                string chcp = "chcp " + oemCp + " >nul & ";
-
-                string ipResetLogPath = Path.Combine(Path.GetTempPath(), "ipreset.log");
 
                 try
                 {
-                    const int T = 120000; // 2 minutos por comando
-
-                    steps.Add(Tuple.Create(
-                        "ipconfig /flushdns",
-                        RunCommand("cmd.exe", "/c " + chcp + "ipconfig /flushdns", T)));
-
-                    steps.Add(Tuple.Create(
-                        "netsh winsock reset",
-                        RunCommand("cmd.exe", "/c " + chcp + "netsh winsock reset", T)));
-
-                    steps.Add(Tuple.Create(
-                        "netsh int ipv4 reset",
-                        RunCommand("cmd.exe", "/c " + chcp + "netsh int ipv4 reset", T)));
-
-                    steps.Add(Tuple.Create(
-                        "netsh int ipv6 reset",
-                        RunCommand("cmd.exe", "/c " + chcp + "netsh int ipv6 reset", T)));
-
-                    steps.Add(Tuple.Create(
-                        "netsh int ip reset (log)",
-                        RunCommand("cmd.exe", "/c " + chcp + "netsh int ip reset \"" + ipResetLogPath + "\"", T)));
-
-                    steps.Add(Tuple.Create(
-                        "ipconfig /release",
-                        RunCommand("cmd.exe", "/c " + chcp + "ipconfig /release", T)));
-
-                    steps.Add(Tuple.Create(
-                        "ipconfig /renew",
-                        RunCommand("cmd.exe", "/c " + chcp + "ipconfig /renew", T)));
+                    result = _netReset.Run(timeoutMsPerCommand: 120000, deepMode: false);
                 }
                 catch (Exception ex)
                 {
                     caught = ex;
                 }
 
-                this.BeginInvoke((Action)(() =>
+                BeginInvoke((Action)(() =>
                 {
                     try
                     {
                         if (caught != null)
                         {
-                            Log("Reset de red: error ❌ " + caught.Message);
+                            _logger.Log("Reset de red: error ❌ " + caught.Message);
+                            SetStatus("Error en Reset de red.");
                             MessageBox.Show(this,
                                 "Error durante el Reset de red:\n\n" + caught,
                                 "Error",
@@ -745,27 +297,10 @@ namespace MiniMantenimiento
                             return;
                         }
 
-                        bool anyPartial = false;
-                        bool anyCritical = false;
+                        _logger.LogNetworkResetResult(result);
 
-                        foreach (var s in steps)
+                        if (result.AnyCritical)
                         {
-                            LogCmd(s.Item1, s.Item2);
-
-                            if (s.Item2.ExitCode != 0)
-                            {
-                                if (IsPartialSuccess(s.Item2))
-                                    anyPartial = true;
-                                else
-                                    anyCritical = true;
-                            }
-                        }
-
-                        Log("Reset de red: terminado.");
-
-                        if (anyCritical)
-                        {
-                            Log("Resultado: ⚠️ Se detectaron errores críticos en uno o más pasos.");
                             MessageBox.Show(this,
                                 "El Reset de red finalizó con algunos errores.\n\n" +
                                 "Revisa el log para más detalles.\n" +
@@ -774,16 +309,10 @@ namespace MiniMantenimiento
                                 MessageBoxButtons.OK,
                                 MessageBoxIcon.Warning);
                         }
-                        else if (anyPartial)
+                        else if (result.AnyPartial)
                         {
-                            Log("Resultado: ⚠️ Éxito parcial con advertencias (Acceso denegado en algunos componentes).");
-                            Log("Nota: Reinicia el equipo para aplicar completamente los cambios.");
-                            Log("Log adicional (si se generó): " + ipResetLogPath);
-
                             MessageBox.Show(this,
                                 "Reset de red completado con advertencias.\n\n" +
-                                "Algunos componentes no pudieron restablecerse por completo,\n" +
-                                "pero los cambios principales se aplicaron.\n\n" +
                                 "Reinicia el equipo para finalizar.",
                                 "Reset de red",
                                 MessageBoxButtons.OK,
@@ -791,9 +320,6 @@ namespace MiniMantenimiento
                         }
                         else
                         {
-                            Log("Resultado: ✅ Reset de red exitoso.");
-                            Log("Nota: Se recomienda reiniciar el equipo para aplicar completamente los cambios.");
-
                             MessageBox.Show(this,
                                 "Reset de red completado correctamente.\n\n" +
                                 "Reinicia el equipo para aplicar todos los cambios.",
@@ -801,143 +327,51 @@ namespace MiniMantenimiento
                                 MessageBoxButtons.OK,
                                 MessageBoxIcon.Information);
                         }
+
+                        SetStatus("Reset de red finalizado.");
                     }
                     finally
                     {
                         pb.Style = ProgressBarStyle.Blocks;
-                        btnNetReset.Enabled = true;
+                        btnNetReset.Enabled = AdminHelper.IsRunningAsAdmin();
+                        SetStatus("Listo.");
                     }
                 }));
             });
-
-
         }
 
-
-        //*REINICIO DE REDES HELPER*//
-
-
-        private class CmdResult
-        {
-            public int ExitCode;
-            public string StdOut;
-            public string StdErr;
-        }
-
-        private CmdResult RunCommand(string fileName, string arguments, int timeoutMs)
-        {
-            // OEM del sistema (en MX/ES casi siempre 850)
-            int oemCp = System.Globalization.CultureInfo.CurrentCulture.TextInfo.OEMCodePage;
-            Encoding oemEnc = Encoding.GetEncoding(oemCp);
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = fileName,
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                StandardOutputEncoding = oemEnc,
-                StandardErrorEncoding = oemEnc
-            };
-
-            using (var p = new Process())
-            {
-                p.StartInfo = psi;
-
-                var sbOut = new StringBuilder();
-                var sbErr = new StringBuilder();
-
-                p.OutputDataReceived += (s, e) => { if (e.Data != null) sbOut.AppendLine(e.Data); };
-                p.ErrorDataReceived += (s, e) => { if (e.Data != null) sbErr.AppendLine(e.Data); };
-
-                p.Start();
-                p.BeginOutputReadLine();
-                p.BeginErrorReadLine();
-
-                bool exited = p.WaitForExit(timeoutMs);
-                if (!exited)
-                {
-                    try { p.Kill(); } catch { }
-                    return new CmdResult
-                    {
-                        ExitCode = -1,
-                        StdOut = sbOut.ToString(),
-                        StdErr = "TIMEOUT: El comando tardó demasiado y se detuvo."
-                    };
-                }
-
-                return new CmdResult
-                {
-                    ExitCode = p.ExitCode,
-                    StdOut = sbOut.ToString(),
-                    StdErr = sbErr.ToString()
-                };
-            }
-        }
-
-
-
-        private bool IsPartialSuccess(CmdResult r)
-        {
-            if (r == null) return false;
-            if (r.ExitCode == 0) return false;
-
-            string text = (r.StdOut ?? "") + "\n" + (r.StdErr ?? "");
-            text = text.ToLowerInvariant();
-
-            return text.Contains("access is denied") ||
-                   text.Contains("acceso denegado");
-        }
-
-
-
-        private void LogCmd(string title, CmdResult r)
-        {
-            bool partial = IsPartialSuccess(r);
-
-            Log("---- " + title + " ----");
-            Log("ExitCode: " + r.ExitCode + (partial ? " (ÉXITO PARCIAL / advertencias)" : ""));
-
-            if (!string.IsNullOrWhiteSpace(r.StdOut))
-            {
-                foreach (var line in r.StdOut.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
-                    Log(line);
-            }
-
-            if (!string.IsNullOrWhiteSpace(r.StdErr))
-            {
-                Log(partial ? "[stderr - advertencias]" : "[stderr]");
-                foreach (var line in r.StdErr.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
-                    Log(line);
-            }
-
-            Log("------------------------");
-        }
-
+        // =========================
+        // SFC
+        // =========================
         private async void btnSfc_Click(object sender, EventArgs e)
         {
+            if (!AdminHelper.IsRunningAsAdmin())
+            {
+                MessageBox.Show(this, "SFC requiere permisos de Administrador.", "SFC",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                RefreshAdminUi();
+                return;
+            }
+
             btnSfc.Enabled = false;
             var oldStyle = pb.Style;
             pb.Style = ProgressBarStyle.Marquee;
+            SetStatus("SFC ejecutándose...");
 
-            var isAdmin = IsRunningAsAdmin();
             var cts = new CancellationTokenSource();
 
             try
             {
-                var start = DateTime.Now;
-                Log("SFC: iniciando...");
+                _logger.Log("SFC: iniciando...");
+                var result = await SfcTask.RunAsync(true, _logger.Log, cts.Token).ConfigureAwait(true);
 
-                var result = await SfcTask.RunAsync(isAdmin, Log, cts.Token);
-
-                Log("SFC: duración total: " + result.Duration);
+                _logger.Log("SFC: duración total: " + result.Duration);
 
                 var icon = MessageBoxIcon.Information;
-                if (result.ResultOutcome == SfcTask.Outcome.Fail_NotElevated ||
-                    result.ResultOutcome == SfcTask.Outcome.Fail_TrustedInstaller ||
-                    result.ResultOutcome == SfcTask.Outcome.Fail_Unknown)
+
+                // Si tu SfcTask es el “viejo” enum: estas condiciones siguen funcionando.
+                // Si es el “nuevo”, también aplica (Fail_*).
+                if (result.ResultOutcome.ToString().IndexOf("Fail_", StringComparison.OrdinalIgnoreCase) >= 0)
                     icon = MessageBoxIcon.Warning;
 
                 MessageBox.Show(this,
@@ -948,38 +382,52 @@ namespace MiniMantenimiento
             }
             catch (OperationCanceledException)
             {
-                Log("SFC: cancelado.");
+                _logger.Log("SFC: cancelado.");
                 MessageBox.Show(this, "SFC fue cancelado.", "SFC", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
-                Log("SFC: ERROR: " + ex.Message);
+                _logger.Log("SFC: ERROR: " + ex.Message);
                 MessageBox.Show(this, "Error en SFC:\n" + ex.Message, "SFC", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
                 pb.Style = oldStyle;
-                btnSfc.Enabled = true;
+                btnSfc.Enabled = AdminHelper.IsRunningAsAdmin();
+                SetStatus("Listo.");
             }
         }
 
+        // =========================
+        // DISM
+        // =========================
         private async void btnDism_Click(object sender, EventArgs e)
         {
+            if (!AdminHelper.IsRunningAsAdmin())
+            {
+                MessageBox.Show(this, "DISM requiere permisos de Administrador.", "DISM",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                RefreshAdminUi();
+                return;
+            }
+
             btnDism.Enabled = false;
             var oldStyle = pb.Style;
             pb.Style = ProgressBarStyle.Marquee;
+            SetStatus("DISM ejecutándose...");
 
-            var isAdmin = IsRunningAsAdmin();
             var cts = new CancellationTokenSource();
 
             try
             {
-                Log("DISM: iniciando...");
-                var result = await DismTask.RunAsync(isAdmin, Log, cts.Token);
+                _logger.Log("DISM: iniciando...");
+                var result = await DismTask.RunAsync(true, _logger.Log, cts.Token).ConfigureAwait(true);
 
-                Log("DISM: duración total: " + result.Duration);
+                _logger.Log("DISM: duración total: " + result.Duration);
 
-                var icon = (result.ResultOutcome == DismTask.Outcome.Ok) ? MessageBoxIcon.Information : MessageBoxIcon.Warning;
+                var icon = (result.ResultOutcome.ToString().IndexOf("Ok", StringComparison.OrdinalIgnoreCase) >= 0)
+                    ? MessageBoxIcon.Information
+                    : MessageBoxIcon.Warning;
 
                 MessageBox.Show(this,
                     "DISM finalizó\n\n" + (result.HumanSummary ?? "Revisa el log para el detalle."),
@@ -989,91 +437,75 @@ namespace MiniMantenimiento
             }
             catch (OperationCanceledException)
             {
-                Log("DISM: cancelado.");
+                _logger.Log("DISM: cancelado.");
                 MessageBox.Show(this, "DISM fue cancelado.", "DISM", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
-                Log("DISM: ERROR: " + ex.Message);
+                _logger.Log("DISM: ERROR: " + ex.Message);
                 MessageBox.Show(this, "Error en DISM:\n" + ex.Message, "DISM", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
                 pb.Style = oldStyle;
-                btnDism.Enabled = true;
+                btnDism.Enabled = AdminHelper.IsRunningAsAdmin();
+                SetStatus("Listo.");
             }
         }
-        // Form1.cs (btnWinUpdateFix_Click actualizado)
-        // Requiere: using System; using System.Threading; using System.Threading.Tasks; using System.Windows.Forms;
 
+        // =========================
+        // WinUpdate FIX (usa WinUpdateFixTask)
+        // =========================
         private async void btnWinUpdateFix_Click(object sender, EventArgs e)
         {
-            // === UI: deshabilita botones y pon barra indeterminada ===
+            if (!AdminHelper.IsRunningAsAdmin())
+            {
+                MessageBox.Show(this,
+                    "Este módulo requiere permisos de Administrador.\n\nCierra y abre la app como Administrador.",
+                    "WinUpdate",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                RefreshAdminUi();
+                return;
+            }
+
+            // Bloquea acciones en paralelo
+            SetBusy(true, "Reparando Windows Update...");
+
+            // Re-habilitaremos manualmente al final
             btnWinUpdateFix.Enabled = false;
 
-            // opcional: deshabilita también los “pesados” para evitar que corran en paralelo
-            btnSfc.Enabled = false;
-            btnDism.Enabled = false;
-            btnDriversRescan.Enabled = false;
-
-            var oldStyle = pb.Style;
-            pb.Style = ProgressBarStyle.Marquee;
-            pb.MarqueeAnimationSpeed = 25;
-
-            // Cancel por si después quieres cablearlo (por ahora none)
             var cts = new CancellationTokenSource();
 
-            // Heartbeat: “sigo trabajando…”
+            // Heartbeat UI friendly (WinForms Timer está bien aquí porque estamos en UI thread)
             var heartbeat = new System.Windows.Forms.Timer();
-            heartbeat.Interval = 20000; // 20s
-            heartbeat.Tick += (s, ev) =>
-            {
-                Log("WinUpdate: sigo trabajando... (esto es normal)");
-            };
+            heartbeat.Interval = 20000;
+            heartbeat.Tick += (s, ev) => { _logger.Log("WinUpdate: sigo trabajando... (esto es normal)"); };
             heartbeat.Start();
-
-            var start = DateTime.Now;
 
             try
             {
-                Log("WinUpdate: iniciando...");
+                _logger.Log("WinUpdate: iniciando...");
 
-                bool isAdmin = IsRunningAsAdmin(); // ya la tienes en tu Form1
-                if (!isAdmin)
-                {
-                    Log("WinUpdate: sin permisos de Administrador. No se puede ejecutar.");
-                    MessageBox.Show(
-                        this,
-                        "Este módulo requiere permisos de Administrador.\n\n" +
-                        "Cierra y abre la app como Administrador.",
-                        "WinUpdate",
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning
-                    );
-                    return;
-                }
-
-                // === Modo profundo (seguro) ===
-                // Si luego quieres un checkbox, aquí lo cambias:
                 bool deepMode = true;
 
-                var result = await MiniMantenimiento.Tasks.WinUpdateTask.RunAsync(
+                // ✅ ACTUALIZADO: WinUpdateFixTask (sin using)
+                var result = await WinUpdateFixTask.RunAsync(
                     isAdmin: true,
-                    log: Log,
+                    log: _logger.Log,
                     ct: cts.Token,
                     deepMode: deepMode
-                );
+                ).ConfigureAwait(true);
 
-                // === Mensaje final humano ===
-                var icon = MessageBoxIcon.Information;
-                if (result.Outcome != MiniMantenimiento.Tasks.WinUpdateTask.WinUpdateOutcome.Ok)
-                    icon = MessageBoxIcon.Warning;
+                var icon = (result.Outcome == WinUpdateFixTask.WinUpdateOutcome.Ok)
+                    ? MessageBoxIcon.Information
+                    : MessageBoxIcon.Warning;
 
                 MessageBox.Show(
                     this,
                     "WinUpdate finalizó.\n\n" +
                     (result.HumanSummary ?? "Revisa el log para el detalle.") +
-                    "\n\nDuración: " + result.Duration.ToString(),
+                    "\n\nDuración: " + result.Duration,
                     "WinUpdate",
                     MessageBoxButtons.OK,
                     icon
@@ -1081,63 +513,66 @@ namespace MiniMantenimiento
             }
             catch (OperationCanceledException)
             {
-                Log("WinUpdate: operación cancelada.");
-                MessageBox.Show(
-                    this,
+                _logger.Log("WinUpdate: operación cancelada.");
+                MessageBox.Show(this,
                     "WinUpdate fue cancelado.\nRevisa el log para el detalle.",
                     "WinUpdate",
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Warning
-                );
+                    MessageBoxIcon.Warning);
             }
             catch (Exception ex)
             {
-                Log("WinUpdate: ERROR -> " + ex.Message);
-                MessageBox.Show(
-                    this,
+                _logger.Log("WinUpdate: ERROR -> " + ex.Message);
+                MessageBox.Show(this,
                     "Ocurrió un error al ejecutar WinUpdate.\n\n" + ex.Message,
                     "WinUpdate",
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Error
-                );
+                    MessageBoxIcon.Error);
             }
             finally
             {
-                // === Apaga heartbeat SIEMPRE ===
                 try { heartbeat.Stop(); } catch { }
                 try { heartbeat.Dispose(); } catch { }
 
-                // === UI: restaura ===
-                pb.Style = oldStyle;
-                pb.MarqueeAnimationSpeed = 0;
+                SetBusy(false, "Listo.");
+                RefreshAdminUi();
+                btnWinUpdateFix.Enabled = AdminHelper.IsRunningAsAdmin();
 
-                btnWinUpdateFix.Enabled = true;
-                btnSfc.Enabled = IsRunningAsAdmin();
-                btnDism.Enabled = IsRunningAsAdmin();
-                btnDriversRescan.Enabled = IsRunningAsAdmin();
-
-                Log("WinUpdate: listo.");
+                _logger.Log("WinUpdate: listo.");
+                SetStatus("Listo.");
             }
         }
 
-
+        // =========================
+        // Drivers rescan
+        // =========================
         private async void btnDriversRescan_Click(object sender, EventArgs e)
         {
+            if (!AdminHelper.IsRunningAsAdmin())
+            {
+                MessageBox.Show(this, "Drivers rescan requiere permisos de Administrador.", "Drivers",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                RefreshAdminUi();
+                return;
+            }
+
             btnDriversRescan.Enabled = false;
             var oldStyle = pb.Style;
             pb.Style = ProgressBarStyle.Marquee;
+            SetStatus("Re-escaneo de hardware en progreso...");
 
-            var isAdmin = IsRunningAsAdmin();
             var cts = new CancellationTokenSource();
 
             try
             {
-                Log("Drivers: iniciando...");
-                var result = await DriversRescanTask.RunAsync(isAdmin, Log, cts.Token);
+                _logger.Log("Drivers: iniciando...");
+                var result = await DriversRescanTask.RunAsync(true, _logger.Log, cts.Token).ConfigureAwait(true);
 
-                Log("Drivers: duración total: " + result.Duration);
+                _logger.Log("Drivers: duración total: " + result.Duration);
 
-                var icon = (result.ResultOutcome == DriversRescanTask.Outcome.Ok) ? MessageBoxIcon.Information : MessageBoxIcon.Warning;
+                var icon = (result.ResultOutcome.ToString().IndexOf("Ok", StringComparison.OrdinalIgnoreCase) >= 0)
+                    ? MessageBoxIcon.Information
+                    : MessageBoxIcon.Warning;
 
                 MessageBox.Show(this,
                     "Drivers finalizó\n\n" + (result.HumanSummary ?? "Revisa el log para el detalle."),
@@ -1147,23 +582,27 @@ namespace MiniMantenimiento
             }
             catch (OperationCanceledException)
             {
-                Log("Drivers: cancelado.");
+                _logger.Log("Drivers: cancelado.");
                 MessageBox.Show(this, "Drivers fue cancelado.", "Drivers", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
-                Log("Drivers: ERROR: " + ex.Message);
+                _logger.Log("Drivers: ERROR: " + ex.Message);
                 MessageBox.Show(this, "Error en Drivers:\n" + ex.Message, "Drivers", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
                 pb.Style = oldStyle;
-                btnDriversRescan.Enabled = true;
+                btnDriversRescan.Enabled = AdminHelper.IsRunningAsAdmin();
+                SetStatus("Listo.");
             }
         }
+
+        // =========================
+        // Event Report (quitar using(...) y dejar igual lógica)
+        // =========================
         private void btnEventReport_Click(object sender, EventArgs e)
         {
-            // 1) Leer UI
             var selectedLogs = clbLogs.CheckedItems.Cast<object>().Select(x => x.ToString()).ToList();
 
             var selectedLevelsText = clbLevels.CheckedItems.Cast<object>().Select(x => x.ToString()).ToList();
@@ -1171,12 +610,12 @@ namespace MiniMantenimiento
 
             foreach (var t in selectedLevelsText)
             {
-                // mapeo a enum
                 if (t.IndexOf("Crítico", StringComparison.OrdinalIgnoreCase) >= 0) levels.Add(EventLogReport.Level.Critical);
                 else if (t.IndexOf("Error", StringComparison.OrdinalIgnoreCase) >= 0) levels.Add(EventLogReport.Level.Error);
                 else if (t.IndexOf("Advertencia", StringComparison.OrdinalIgnoreCase) >= 0) levels.Add(EventLogReport.Level.Warning);
                 else if (t.IndexOf("Información", StringComparison.OrdinalIgnoreCase) >= 0) levels.Add(EventLogReport.Level.Information);
-                else if (t.IndexOf("Detallado", StringComparison.OrdinalIgnoreCase) >= 0 || t.IndexOf("Verbose", StringComparison.OrdinalIgnoreCase) >= 0) levels.Add(EventLogReport.Level.Verbose);
+                else if (t.IndexOf("Detallado", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         t.IndexOf("Verbose", StringComparison.OrdinalIgnoreCase) >= 0) levels.Add(EventLogReport.Level.Verbose);
             }
 
             if (selectedLogs.Count == 0)
@@ -1194,7 +633,6 @@ namespace MiniMantenimiento
             int maxEvents = (int)nudMaxEvents.Value;
             bool fullMsg = chkFullMessage.Checked;
 
-            // 2) Rango de tiempo
             int days = 7;
             string range = (cmbRange.SelectedItem != null ? cmbRange.SelectedItem.ToString() : "Últimos 7 días");
             if (range.IndexOf("24", StringComparison.OrdinalIgnoreCase) >= 0) days = 1;
@@ -1203,10 +641,9 @@ namespace MiniMantenimiento
 
             DateTime fromUtc = DateTime.UtcNow.AddDays(-days);
 
-            // 3) Alerta masiva (advertencia/info/verbose)
             bool massive = levels.Contains(EventLogReport.Level.Warning) ||
-                          levels.Contains(EventLogReport.Level.Information) ||
-                          levels.Contains(EventLogReport.Level.Verbose);
+                           levels.Contains(EventLogReport.Level.Information) ||
+                           levels.Contains(EventLogReport.Level.Verbose);
 
             if (massive)
             {
@@ -1222,9 +659,10 @@ namespace MiniMantenimiento
                     return;
             }
 
-            // 4) Elegir archivo destino (TXT o CSV)
-            using (var sfd = new SaveFileDialog())
+            SaveFileDialog sfd = null;
+            try
             {
+                sfd = new SaveFileDialog();
                 sfd.Title = "Guardar reporte";
                 sfd.Filter = "Reporte TXT (*.txt)|*.txt|Reporte CSV (*.csv)|*.csv";
                 sfd.FileName = "EventReport_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
@@ -1235,15 +673,15 @@ namespace MiniMantenimiento
                 string path = sfd.FileName;
                 bool exportCsv = (sfd.FilterIndex == 2) || path.EndsWith(".csv", StringComparison.OrdinalIgnoreCase);
 
-                // 5) Correr en background
                 btnEventReport.Enabled = false;
                 pb.Style = ProgressBarStyle.Marquee;
+                SetStatus("Generando reporte de eventos...");
 
-                Log("EventReport: iniciando...");
-                Log("Logs: " + string.Join(", ", selectedLogs));
-                Log("Niveles: " + string.Join(", ", levels.Select(l => l.ToString())));
-                Log("Rango: " + range + " | Desde (UTC): " + fromUtc.ToString("o"));
-                Log("Máx eventos: " + maxEvents + " | Mensaje completo: " + (fullMsg ? "Sí" : "No"));
+                _logger.Log("EventReport: iniciando...");
+                _logger.Log("Logs: " + string.Join(", ", selectedLogs));
+                _logger.Log("Niveles: " + string.Join(", ", levels.Select(l => l.ToString())));
+                _logger.Log("Rango: " + range + " | Desde (UTC): " + fromUtc.ToString("o"));
+                _logger.Log("Máx eventos: " + maxEvents + " | Mensaje completo: " + (fullMsg ? "Sí" : "No"));
 
                 Task.Run(() =>
                 {
@@ -1261,29 +699,24 @@ namespace MiniMantenimiento
                             IncludeFullMessage = fullMsg
                         };
 
-                        result = EventLogReport.Generate(opt, CancellationToken.None, (count) =>
-                        {
-                            // opcional: podrías actualizar un label de "count"
-                            // aquí lo dejamos silencioso para no spamear UI.
-                        });
+                        result = EventLogReport.Generate(opt, CancellationToken.None, (count) => { });
 
-                        if (exportCsv)
-                            EventLogReport.ExportCsv(result, path);
-                        else
-                            EventLogReport.ExportTxt(result, path);
+                        if (exportCsv) EventLogReport.ExportCsv(result, path);
+                        else EventLogReport.ExportTxt(result, path);
                     }
                     catch (Exception ex)
                     {
                         caught = ex;
                     }
 
-                    this.BeginInvoke((Action)(() =>
+                    BeginInvoke((Action)(() =>
                     {
                         try
                         {
                             if (caught != null)
                             {
-                                Log("EventReport: error ❌ " + caught.Message);
+                                _logger.Log("EventReport: error ❌ " + caught.Message);
+                                SetStatus("Error generando reporte.");
                                 MessageBox.Show(this, "Error generando reporte:\n\n" + caught, "Event Report",
                                     MessageBoxButtons.OK, MessageBoxIcon.Error);
                                 return;
@@ -1292,12 +725,12 @@ namespace MiniMantenimiento
                             if (result != null && result.Warnings.Count > 0)
                             {
                                 foreach (var w in result.Warnings)
-                                    Log("EventReport [WARN] " + w);
+                                    _logger.Log("EventReport [WARN] " + w);
                             }
 
-                            Log("EventReport: listo ✅");
-                            Log("Guardado en: " + path);
-                            Log("Eventos exportados: " + (result != null ? result.Entries.Count.ToString() : "0"));
+                            _logger.Log("EventReport: listo ✅");
+                            _logger.Log("Guardado en: " + path);
+                            _logger.Log("Eventos exportados: " + (result != null ? result.Entries.Count.ToString() : "0"));
 
                             MessageBox.Show(this,
                                 "Reporte generado.\n\n" +
@@ -1306,39 +739,60 @@ namespace MiniMantenimiento
                                 "Event Report",
                                 MessageBoxButtons.OK,
                                 MessageBoxIcon.Information);
+
+                            SetStatus("Reporte generado.");
                         }
                         finally
                         {
                             pb.Style = ProgressBarStyle.Blocks;
                             btnEventReport.Enabled = true;
+                            SetStatus("Listo.");
                         }
                     }));
                 });
             }
+            finally
+            {
+                if (sfd != null)
+                {
+                    try { sfd.Dispose(); } catch { }
+                }
+            }
         }
 
-
+        // =========================
+        // Exportar log (sin using)
+        // =========================
         private void btnExportLog_Click(object sender, EventArgs e)
         {
+            SaveFileDialog sfd = null;
             try
             {
-                using (SaveFileDialog sfd = new SaveFileDialog())
-                {
-                    sfd.Title = "Guardar log";
-                    sfd.Filter = "Archivo de texto (*.txt)|*.txt";
-                    sfd.FileName = "Log_MiniMantenimiento_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".txt";
+                sfd = new SaveFileDialog();
+                sfd.Title = "Guardar log";
+                sfd.Filter = "Archivo de texto (*.txt)|*.txt";
+                sfd.FileName = "Log_MiniMantenimiento_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".txt";
 
-                    if (sfd.ShowDialog(this) != DialogResult.OK)
-                        return;
+                if (sfd.ShowDialog(this) != DialogResult.OK)
+                    return;
 
-                    File.WriteAllText(sfd.FileName, _log.ToString(), Encoding.UTF8);
-                    Log("Log exportado: " + sfd.FileName);
-                }
+                File.WriteAllText(sfd.FileName, _log.ToString(), Encoding.UTF8);
+                _logger.Log("Log exportado: " + sfd.FileName);
+                SetStatus("Log exportado.");
             }
             catch (Exception ex)
             {
                 MessageBox.Show(this, "No se pudo exportar el log.\n\n" + ex.Message, "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
+                SetStatus("Error exportando log.");
+            }
+            finally
+            {
+                if (sfd != null)
+                {
+                    try { sfd.Dispose(); } catch { }
+                }
+                SetStatus("Listo.");
             }
         }
     }

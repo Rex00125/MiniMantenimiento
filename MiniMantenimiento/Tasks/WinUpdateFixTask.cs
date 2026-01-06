@@ -1,4 +1,4 @@
-﻿// WinUpdateTask.cs
+﻿// Tasks/WinUpdateFixTask.cs
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -9,13 +9,14 @@ using System.Threading.Tasks;
 
 namespace MiniMantenimiento.Tasks
 {
-    internal static class WinUpdateTask
+    internal static class WinUpdateFixTask
     {
         internal enum WinUpdateOutcome
         {
             Ok,
             Fail_NotElevated,
             Fail_CommandError,
+            Fail_Canceled,
             Fail_Exception
         }
 
@@ -57,62 +58,63 @@ namespace MiniMantenimiento.Tasks
                 log("WinUpdate: iniciando reparación de Windows Update...");
                 log("WinUpdate: modo " + (deepMode ? "PROFUNDO" : "NORMAL"));
 
-                result.ServicesSnapshotBefore = await GetServicesSnapshotAsync(log, ct);
+                ct.ThrowIfCancellationRequested();
+
+                result.ServicesSnapshotBefore = await GetServicesSnapshotAsync(log, ct).ConfigureAwait(false);
 
                 if (deepMode)
                 {
                     log("---- Diagnóstico ----");
 
-                    await RunAndLogAsync(
-                        "dism /online /cleanup-image /checkhealth",
-                        log, ct, true);
+                    await RunAndLogAsync("dism /online /cleanup-image /checkhealth", log, ct, true).ConfigureAwait(false);
+                    await RunAndLogAsync("dism /online /cleanup-image /scanhealth", log, ct, true).ConfigureAwait(false);
 
-                    await RunAndLogAsync(
-                        "dism /online /cleanup-image /scanhealth",
-                        log, ct, true);
-
+                    // 50 eventos recientes del canal Operational
                     await RunAndLogAsync(
                         "wevtutil qe \"Microsoft-Windows-WindowsUpdateClient/Operational\" /c:50 /f:text",
-                        log, ct, true);
+                        log, ct, true).ConfigureAwait(false);
                 }
 
                 log("---- Reset Windows Update ----");
 
-                await StopServiceSafeAsync("wuauserv", log, ct);
-                await StopServiceSafeAsync("bits", log, ct);
-                await StopServiceSafeAsync("cryptsvc", log, ct);
-                await StopServiceSafeAsync("msiserver", log, ct);
+                await StopServiceSafeAsync("wuauserv", log, ct).ConfigureAwait(false);
+                await StopServiceSafeAsync("bits", log, ct).ConfigureAwait(false);
+                await StopServiceSafeAsync("cryptsvc", log, ct).ConfigureAwait(false);
+                await StopServiceSafeAsync("msiserver", log, ct).ConfigureAwait(false);
 
+                // Limpiar cola BITS
                 await RunAndLogAsync(
                     "del /q /f \"%ALLUSERSPROFILE%\\Application Data\\Microsoft\\Network\\Downloader\\qmgr*.dat\" 2>nul",
-                    log, ct, false);
+                    log, ct, false).ConfigureAwait(false);
 
                 string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                await RenameDirSafeAsync(@"C:\Windows\SoftwareDistribution", "SoftwareDistribution_bak_" + stamp, log, ct);
-                await RenameDirSafeAsync(@"C:\Windows\System32\catroot2", "catroot2_bak_" + stamp, log, ct);
 
-                await StartServiceSafeAsync("cryptsvc", log, ct);
-                await StartServiceSafeAsync("bits", log, ct);
-                await StartServiceSafeAsync("wuauserv", log, ct);
-                await StartServiceSafeAsync("msiserver", log, ct);
+                await RenameDirSafeAsync(@"C:\Windows\SoftwareDistribution", "SoftwareDistribution_bak_" + stamp, log, ct).ConfigureAwait(false);
+                await RenameDirSafeAsync(@"C:\Windows\System32\catroot2", "catroot2_bak_" + stamp, log, ct).ConfigureAwait(false);
 
-                result.ServicesSnapshotAfter = await GetServicesSnapshotAsync(log, ct);
+                await StartServiceSafeAsync("cryptsvc", log, ct).ConfigureAwait(false);
+                await StartServiceSafeAsync("bits", log, ct).ConfigureAwait(false);
+                await StartServiceSafeAsync("wuauserv", log, ct).ConfigureAwait(false);
+                await StartServiceSafeAsync("msiserver", log, ct).ConfigureAwait(false);
+
+                result.ServicesSnapshotAfter = await GetServicesSnapshotAsync(log, ct).ConfigureAwait(false);
 
                 result.Outcome = WinUpdateOutcome.Ok;
                 result.ExitCode = 0;
                 result.HumanSummary = "Reparación completada correctamente.";
-
                 return result;
             }
             catch (OperationCanceledException)
             {
-                result.Outcome = WinUpdateOutcome.Fail_CommandError;
+                result.Outcome = WinUpdateOutcome.Fail_Canceled;
+                result.ExitCode = -2;
                 result.HumanSummary = "Operación cancelada.";
                 return result;
             }
             catch (Exception ex)
             {
                 result.Outcome = WinUpdateOutcome.Fail_Exception;
+                result.ExitCode = -3;
                 result.HumanSummary = "Error inesperado: " + ex.Message;
                 return result;
             }
@@ -120,7 +122,7 @@ namespace MiniMantenimiento.Tasks
             {
                 sw.Stop();
                 result.Duration = sw.Elapsed;
-                log("WinUpdate: duración total " + sw.Elapsed);
+                try { log("WinUpdate: duración total " + sw.Elapsed); } catch { }
             }
         }
 
@@ -133,10 +135,10 @@ namespace MiniMantenimiento.Tasks
             var sb = new StringBuilder();
             sb.AppendLine("Servicios:");
 
-            sb.AppendLine(await QueryServiceLineAsync("wuauserv", ct));
-            sb.AppendLine(await QueryServiceLineAsync("bits", ct));
-            sb.AppendLine(await QueryServiceLineAsync("cryptsvc", ct));
-            sb.AppendLine(await QueryServiceLineAsync("msiserver", ct));
+            sb.AppendLine(await QueryServiceLineAsync("wuauserv", ct).ConfigureAwait(false));
+            sb.AppendLine(await QueryServiceLineAsync("bits", ct).ConfigureAwait(false));
+            sb.AppendLine(await QueryServiceLineAsync("cryptsvc", ct).ConfigureAwait(false));
+            sb.AppendLine(await QueryServiceLineAsync("msiserver", ct).ConfigureAwait(false));
 
             string snap = sb.ToString();
             log(snap.TrimEnd());
@@ -145,7 +147,7 @@ namespace MiniMantenimiento.Tasks
 
         private static async Task<string> QueryServiceLineAsync(string service, CancellationToken ct)
         {
-            var r = await RunCmdAsync("sc query " + service, ct);
+            var r = await RunCmdAsync("sc query " + service, ct).ConfigureAwait(false);
             return "- " + service + ": " + ExtractScState(r.Output);
         }
 
@@ -163,22 +165,27 @@ namespace MiniMantenimiento.Tasks
 
         private static async Task StopServiceSafeAsync(string name, Action<string> log, CancellationToken ct)
         {
-            var r = await RunCmdAsync("net stop " + name, ct);
+            var r = await RunCmdAsync("net stop " + name, ct).ConfigureAwait(false);
             LogCommandOutput("net stop " + name, r, log, true);
         }
 
         private static async Task StartServiceSafeAsync(string name, Action<string> log, CancellationToken ct)
         {
-            var r = await RunCmdAsync("net start " + name, ct);
+            var r = await RunCmdAsync("net start " + name, ct).ConfigureAwait(false);
             LogCommandOutput("net start " + name, r, log, true);
         }
 
         private static async Task RenameDirSafeAsync(string path, string newName, Action<string> log, CancellationToken ct)
         {
-            var check = await RunCmdAsync("if exist \"" + path + "\" (echo OK) else (echo NO)", ct);
-            if (!check.Output.Contains("OK")) return;
+            // check existencia
+            var check = await RunCmdAsync("if exist \"" + path + "\" (echo OK) else (echo NO)", ct).ConfigureAwait(false);
+            if (check.Output == null || check.Output.IndexOf("OK", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                log("Skip ren: no existe " + path);
+                return;
+            }
 
-            var r = await RunCmdAsync("ren \"" + path + "\" \"" + newName + "\"", ct);
+            var r = await RunCmdAsync("ren \"" + path + "\" \"" + newName + "\"", ct).ConfigureAwait(false);
             LogCommandOutput("ren " + path, r, log, false);
         }
 
@@ -186,21 +193,13 @@ namespace MiniMantenimiento.Tasks
         // Logging
         // =========================
 
-        private static async Task RunAndLogAsync(
-            string command,
-            Action<string> log,
-            CancellationToken ct,
-            bool trim)
+        private static async Task RunAndLogAsync(string command, Action<string> log, CancellationToken ct, bool trim)
         {
-            var r = await RunCmdAsync(command, ct);
+            var r = await RunCmdAsync(command, ct).ConfigureAwait(false);
             LogCommandOutput(command, r, log, trim);
         }
 
-        private static void LogCommandOutput(
-            string cmd,
-            CmdResult r,
-            Action<string> log,
-            bool trim)
+        private static void LogCommandOutput(string cmd, CmdResult r, Action<string> log, bool trim)
         {
             log("---- " + cmd);
             log("ExitCode: " + r.ExitCode);
@@ -253,65 +252,122 @@ namespace MiniMantenimiento.Tasks
 
         private static async Task<CmdResult> RunCmdAsync(string command, CancellationToken ct)
         {
-            var psi = new ProcessStartInfo
-            {
-                FileName = "cmd.exe",
-                Arguments = "/u /c " + command,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
+            Process p = null;
+            CancellationTokenRegistration reg = default(CancellationTokenRegistration);
 
-            using (var p = new Process { StartInfo = psi, EnableRaisingEvents = true })
+            try
             {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = "/u /c " + command,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                p = new Process();
+                p.StartInfo = psi;
+                p.EnableRaisingEvents = true;
+
+                // Cancelación: mata cmd.exe
+                reg = ct.Register(() =>
+                {
+                    try
+                    {
+                        if (p != null && !p.HasExited)
+                            p.Kill();
+                    }
+                    catch { }
+                });
+
                 p.Start();
 
                 var outTask = ReadAllBytesAsync(p.StandardOutput.BaseStream, ct);
                 var errTask = ReadAllBytesAsync(p.StandardError.BaseStream, ct);
 
-                await WaitForExitAsync(p, ct);
+                await WaitForExitAsync(p, ct).ConfigureAwait(false);
+
+                byte[] outBytes = await outTask.ConfigureAwait(false);
+                byte[] errBytes = await errTask.ConfigureAwait(false);
 
                 return new CmdResult
                 {
-                    ExitCode = p.ExitCode,
-                    Output = Decode(await outTask),
-                    Error = Decode(await errTask)
+                    ExitCode = SafeExitCode(p),
+                    Output = Decode(outBytes),
+                    Error = Decode(errBytes)
                 };
             }
+            finally
+            {
+                try { reg.Dispose(); } catch { }
+                if (p != null)
+                {
+                    try { p.Dispose(); } catch { }
+                }
+            }
+        }
+
+        private static int SafeExitCode(Process p)
+        {
+            try { return p.ExitCode; }
+            catch { return -999; }
         }
 
         private static async Task<byte[]> ReadAllBytesAsync(Stream s, CancellationToken ct)
         {
-            using (var ms = new MemoryStream())
+            MemoryStream ms = null;
+            try
             {
-                await s.CopyToAsync(ms, 81920, ct);
+                ms = new MemoryStream();
+                await s.CopyToAsync(ms, 81920, ct).ConfigureAwait(false);
                 return ms.ToArray();
+            }
+            finally
+            {
+                if (ms != null)
+                {
+                    try { ms.Dispose(); } catch { }
+                }
             }
         }
 
         private static Task WaitForExitAsync(Process p, CancellationToken ct)
         {
-            var tcs = new TaskCompletionSource<object>();
+            var tcs = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
 
             EventHandler h = null;
+            CancellationTokenRegistration reg = default(CancellationTokenRegistration);
+
             h = (s, e) =>
             {
-                p.Exited -= h;
+                try { p.Exited -= h; } catch { }
+                try { reg.Dispose(); } catch { }
                 tcs.TrySetResult(null);
             };
 
-            p.Exited += h;
+            try { p.Exited += h; } catch { }
 
             if (p.HasExited)
             {
-                p.Exited -= h;
+                try { p.Exited -= h; } catch { }
+                try { reg.Dispose(); } catch { }
                 tcs.TrySetResult(null);
+                return tcs.Task;
             }
 
-            ct.Register(() =>
+            reg = ct.Register(() =>
             {
-                try { if (!p.HasExited) p.Kill(); } catch { }
+                try
+                {
+                    if (!p.HasExited)
+                        p.Kill();
+                }
+                catch { }
+
+                try { p.Exited -= h; } catch { }
+                try { reg.Dispose(); } catch { }
                 tcs.TrySetCanceled();
             });
 
@@ -322,6 +378,7 @@ namespace MiniMantenimiento.Tasks
         {
             if (bytes == null || bytes.Length == 0) return "";
 
+            // BOM/Unicode heuristic
             if (bytes.Length > 1 && bytes[1] == 0x00)
                 return Encoding.Unicode.GetString(bytes);
 
@@ -331,7 +388,8 @@ namespace MiniMantenimiento.Tasks
             }
             catch
             {
-                return Encoding.Default.GetString(bytes);
+                try { return Encoding.Default.GetString(bytes); }
+                catch { return ""; }
             }
         }
     }

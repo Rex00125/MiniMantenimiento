@@ -176,8 +176,7 @@ namespace MiniMantenimiento.Tasks
             var sbOut = new StringBuilder();
             var sbErr = new StringBuilder();
 
-            p.OutputDataReceived += (s, e) => { if (e.Data != null) sbOut.AppendLine(e.Data); };
-            p.ErrorDataReceived += (s, e) => { if (e.Data != null) sbErr.AppendLine(e.Data); };
+
 
             p.Exited += (s, e) =>
             {
@@ -210,8 +209,6 @@ namespace MiniMantenimiento.Tasks
             try
             {
                 p.Start();
-                p.BeginOutputReadLine();
-                p.BeginErrorReadLine();
             }
             catch (Exception ex)
             {

@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Forms;
 
 namespace MiniMantenimiento.Tasks
 {
@@ -13,7 +12,9 @@ namespace MiniMantenimiento.Tasks
         {
             Ok,
             Fail_NotElevated,
-            Fail_Unknown
+            Fail_Canceled,
+            Fail_CommandError,
+            Fail_Exception
         }
 
         public sealed class TaskResult
@@ -37,6 +38,8 @@ namespace MiniMantenimiento.Tasks
                     ResultOutcome = Outcome.Fail_NotElevated,
                     ExitCode = -1,
                     Duration = TimeSpan.Zero,
+                    StdOut = "",
+                    StdErr = "",
                     HumanSummary = "DISM requiere permisos de Administrador."
                 };
             }
@@ -49,48 +52,96 @@ namespace MiniMantenimiento.Tasks
 
             log("Ejecutando: cmd.exe " + cmdArgs);
 
-            var heartbeat = new System.Windows.Forms.Timer();
-            heartbeat.Interval = 20000;
-            heartbeat.Tick += (s, e) => log("DISM: sigo trabajando... (esto es normal)");
-            heartbeat.Start();
-
-            ProcResult pr;
+            Timer heartbeat = null;
             try
             {
-                pr = await RunCmdUtf8CleanAsync(cmdArgs, ct).ConfigureAwait(false);
+                heartbeat = new Timer(_ =>
+                {
+                    try { log("DISM: sigo trabajando... (esto es normal)"); } catch { }
+                }, null, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(20));
+
+                ProcResult pr = await RunCmdUtf8CleanAsync(cmdArgs, log, ct).ConfigureAwait(false);
+
+                sw.Stop();
+
+                Outcome outcome;
+                string summary;
+
+                if (ct.IsCancellationRequested)
+                {
+                    outcome = Outcome.Fail_Canceled;
+                    summary = "DISM fue cancelado.";
+                }
+                else if (pr.exitCode == 0)
+                {
+                    outcome = Outcome.Ok;
+                    summary = "DISM finalizó correctamente.";
+                }
+                else
+                {
+                    outcome = Outcome.Fail_CommandError;
+                    summary = "DISM terminó con error. Revisa el log para el detalle.";
+                }
+
+                log("ExitCode: " + pr.exitCode);
+
+                if (!string.IsNullOrWhiteSpace(pr.stdout))
+                    log(pr.stdout.TrimEnd());
+
+                if (!string.IsNullOrWhiteSpace(pr.stderr))
+                    log(pr.stderr.TrimEnd());
+
+                log("----------------------------");
+                log("DISM: " + summary);
+                log("DISM: duración total: " + sw.Elapsed);
+
+                return new TaskResult
+                {
+                    ResultOutcome = outcome,
+                    ExitCode = pr.exitCode,
+                    Duration = sw.Elapsed,
+                    StdOut = pr.stdout,
+                    StdErr = pr.stderr,
+                    HumanSummary = summary
+                };
+            }
+            catch (OperationCanceledException)
+            {
+                sw.Stop();
+                log("DISM: cancelado por el usuario.");
+
+                return new TaskResult
+                {
+                    ResultOutcome = Outcome.Fail_Canceled,
+                    ExitCode = -2,
+                    Duration = sw.Elapsed,
+                    StdOut = "",
+                    StdErr = "",
+                    HumanSummary = "DISM fue cancelado."
+                };
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                log("DISM: excepción: " + ex.Message);
+
+                return new TaskResult
+                {
+                    ResultOutcome = Outcome.Fail_Exception,
+                    ExitCode = -3,
+                    Duration = sw.Elapsed,
+                    StdOut = "",
+                    StdErr = ex.ToString(),
+                    HumanSummary = "DISM falló por excepción. Revisa el log."
+                };
             }
             finally
             {
-                try { heartbeat.Stop(); } catch { }
-                try { heartbeat.Dispose(); } catch { }
-                sw.Stop();
+                if (heartbeat != null)
+                {
+                    try { heartbeat.Dispose(); } catch { }
+                }
             }
-
-            var summary = (pr.exitCode == 0)
-                ? "DISM finalizó correctamente."
-                : "DISM terminó con error. Revisa el log para el detalle.";
-
-            log("ExitCode: " + pr.exitCode);
-
-            if (!string.IsNullOrWhiteSpace(pr.stdout))
-                log(pr.stdout.TrimEnd());
-
-            if (!string.IsNullOrWhiteSpace(pr.stderr))
-                log(pr.stderr.TrimEnd());
-
-            log("----------------------------");
-            log("DISM: " + summary);
-            log("DISM: duración total: " + sw.Elapsed);
-
-            return new TaskResult
-            {
-                ResultOutcome = (pr.exitCode == 0) ? Outcome.Ok : Outcome.Fail_Unknown,
-                ExitCode = pr.exitCode,
-                Duration = sw.Elapsed,
-                StdOut = pr.stdout,
-                StdErr = pr.stderr,
-                HumanSummary = summary
-            };
         }
 
         private struct ProcResult
@@ -101,13 +152,17 @@ namespace MiniMantenimiento.Tasks
         }
 
         /// <summary>
-        /// Ejecuta CMD forzando UTF-8 (chcp 65001) y limpia:
-        /// - líneas de progreso tipo: [===  5.4%  ]
+        /// Ejecuta CMD con UTF-8 (chcp 65001) y limpia:
+        /// - barras de progreso tipo: [===  5.4%  ]
         /// - spam de líneas vacías
+        /// Además: manda líneas limpias al log en vivo.
         /// </summary>
-        private static Task<ProcResult> RunCmdUtf8CleanAsync(string cmdArgs, CancellationToken ct)
+        private static Task<ProcResult> RunCmdUtf8CleanAsync(string cmdArgs, Action<string> log, CancellationToken ct)
         {
             var tcs = new TaskCompletionSource<ProcResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            Process p = null;
+            CancellationTokenRegistration ctr = default(CancellationTokenRegistration);
 
             var psi = new ProcessStartInfo
             {
@@ -121,108 +176,140 @@ namespace MiniMantenimiento.Tasks
                 StandardErrorEncoding = new UTF8Encoding(false),
             };
 
-            var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
-
             var sbOut = new StringBuilder();
             var sbErr = new StringBuilder();
 
-            // Para evitar que DISM nos meta 200 saltos de línea seguidos.
             bool lastOutWasBlank = false;
             bool lastErrWasBlank = false;
 
-            p.OutputDataReceived += (s, e) =>
-            {
-                if (e.Data == null) return;
-
-                var line = e.Data;
-
-                if (ShouldSkipLine(line)) return;
-
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    if (lastOutWasBlank) return;
-                    lastOutWasBlank = true;
-                    sbOut.AppendLine(); // deja solo un salto
-                    return;
-                }
-
-                lastOutWasBlank = false;
-                sbOut.AppendLine(line);
-            };
-
-            p.ErrorDataReceived += (s, e) =>
-            {
-                if (e.Data == null) return;
-
-                var line = e.Data;
-
-                if (ShouldSkipLine(line)) return;
-
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    if (lastErrWasBlank) return;
-                    lastErrWasBlank = true;
-                    sbErr.AppendLine();
-                    return;
-                }
-
-                lastErrWasBlank = false;
-                sbErr.AppendLine(line);
-            };
-
-            p.Exited += (s, e) =>
-            {
-                try
-                {
-                    var r = new ProcResult
-                    {
-                        exitCode = p.ExitCode,
-                        stdout = sbOut.ToString(),
-                        stderr = sbErr.ToString()
-                    };
-                    tcs.TrySetResult(r);
-                }
-                catch (Exception ex)
-                {
-                    tcs.TrySetException(ex);
-                }
-                finally
-                {
-                    try { p.Dispose(); } catch { }
-                }
-            };
-
-            ct.Register(() =>
-            {
-                try { if (!p.HasExited) p.Kill(); } catch { }
-                tcs.TrySetCanceled();
-            });
-
             try
             {
+                p = new Process();
+                p.StartInfo = psi;
+                p.EnableRaisingEvents = true;
+
+                p.OutputDataReceived += (s, e) =>
+                {
+                    if (e.Data == null) return;
+
+                    var line = e.Data;
+                    if (ShouldSkipLine(line)) return;
+
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        if (lastOutWasBlank) return;
+                        lastOutWasBlank = true;
+                        sbOut.AppendLine();
+                        return;
+                    }
+
+                    lastOutWasBlank = false;
+                    sbOut.AppendLine(line);
+
+                    try { log(line); } catch { }
+                };
+
+                p.ErrorDataReceived += (s, e) =>
+                {
+                    if (e.Data == null) return;
+
+                    var line = e.Data;
+                    if (ShouldSkipLine(line)) return;
+
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        if (lastErrWasBlank) return;
+                        lastErrWasBlank = true;
+                        sbErr.AppendLine();
+                        return;
+                    }
+
+                    lastErrWasBlank = false;
+                    sbErr.AppendLine(line);
+
+                    try { log(line); } catch { }
+                };
+
+                p.Exited += (s, e) =>
+                {
+                    try
+                    {
+                        var r = new ProcResult
+                        {
+                            exitCode = SafeGetExitCode(p),
+                            stdout = sbOut.ToString(),
+                            stderr = sbErr.ToString()
+                        };
+                        tcs.TrySetResult(r);
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.TrySetException(ex);
+                    }
+                    finally
+                    {
+                        // Limpieza aquí también por si el caller se olvida
+                        try { ctr.Dispose(); } catch { }
+                        try { if (p != null) p.Dispose(); } catch { }
+                    }
+                };
+
+                // Cancelación: mata el proceso si sigue vivo
+                ctr = ct.Register(() =>
+                {
+                    try
+                    {
+                        if (p != null && !p.HasExited)
+                        {
+                            TryKill(p);
+                        }
+                    }
+                    catch { }
+                    tcs.TrySetCanceled();
+                });
+
+                ct.ThrowIfCancellationRequested();
+
                 p.Start();
+
+                // IMPORTANTÍSIMO: sin esto NO llegan datos a OutputDataReceived/ErrorDataReceived
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
             }
             catch (Exception ex)
             {
-                try { p.Dispose(); } catch { }
+                try { if (p != null && !p.HasExited) TryKill(p); } catch { }
+                try { ctr.Dispose(); } catch { }
+                try { if (p != null) p.Dispose(); } catch { }
                 tcs.TrySetException(ex);
             }
 
             return tcs.Task;
         }
 
+        private static int SafeGetExitCode(Process p)
+        {
+            try { return p.ExitCode; }
+            catch { return -999; }
+        }
+
+        private static void TryKill(Process p)
+        {
+            try
+            {
+                // .NET Framework: no hay "entireProcessTree"
+                p.Kill();
+            }
+            catch { }
+        }
+
         private static bool ShouldSkipLine(string line)
         {
             if (line == null) return true;
 
-            // 1) Progreso DISM típico:
-            // "[==                         3.8%                           ]"
             if (IsDismProgressLine(line))
                 return true;
 
-            // 2) Por si DISM suelta “artefactos” raros:
             if (IsMostlyWeirdSymbols(line))
                 return true;
 
@@ -231,8 +318,6 @@ namespace MiniMantenimiento.Tasks
 
         private static bool IsDismProgressLine(string line)
         {
-            // Formato: empieza con [, termina con ], contiene %,
-            // y casi todo son = espacios y números/punto.
             var t = line.Trim();
             if (t.Length < 5) return false;
             if (t[0] != '[' || t[t.Length - 1] != ']') return false;
@@ -242,7 +327,7 @@ namespace MiniMantenimiento.Tasks
             {
                 if (c == '[' || c == ']' || c == '=' || c == ' ' || c == '%' || c == '.' || char.IsDigit(c))
                     continue;
-                return false; // si trae letras, ya no es la barrita
+                return false;
             }
             return true;
         }
@@ -256,7 +341,8 @@ namespace MiniMantenimiento.Tasks
             {
                 if (c == '\t' || c == ' ') continue;
                 total++;
-                if (!char.IsLetterOrDigit(c) && c != '.' && c != ',' && c != ':' && c != '/' && c != '-' && c != '%' && c != '(' && c != ')')
+                if (!char.IsLetterOrDigit(c) &&
+                    c != '.' && c != ',' && c != ':' && c != '/' && c != '-' && c != '%' && c != '(' && c != ')')
                     weird++;
             }
             return (total >= 20 && weird > (total * 0.6));
